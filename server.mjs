@@ -29,6 +29,14 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "10mb" }));
 
+// ---- GLOBAL DEBUG LOGGER (zeigt alle Webhook-Calls) ----
+app.use((req, _res, next) => {
+  if (req.path.startsWith("/webhooks/")) {
+    console.log(`[REQ] ${req.method} ${req.path} q=${JSON.stringify(req.query||{})}`);
+  }
+  next();
+});
+
 const MODEL_NAME = "Seedream v4 (edit-sequential)";
 
 const SUBMIT_MAX_RETRIES = 3;
@@ -272,13 +280,6 @@ async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, fail
     last_update: nowISO()
   });
 
-  // Optional: weitere Output-Felder pflegen
-  // await sbUpdateGenerationsRow(rowId, {
-  //   output_first_url: savedPublicUrls[0] || null,
-  //   output_count: (row.output_count || 0) + savedPublicUrls.length,
-  //   output_urls: savedPublicUrls
-  // });
-
   await markCompletedIfReady(rowId);
 }
 
@@ -354,103 +355,4 @@ async function startRunFromRow(rowId, opts = {}) {
 /* ===================== Poller ===================== */
 const _lastStatus = new Map();
 
-async function pollUntilDone(requestId, parentRowId) {
-  const start = Date.now();
-  let attempts = 0;
-  let first = true;
-
-  while (Date.now() - start < POLL_TIMEOUT_MS) {
-    try {
-      const { status, outputs, raw } = await getResult(requestId);
-      const prev = _lastStatus.get(requestId);
-      if (first) { console.log(`[POLL INIT] ${requestId} status=${status}`, JSON.stringify(raw?.data || raw)); first = false; }
-      if (prev !== status) { console.log(`[POLL] ${requestId} ${prev || "(none)"} -> ${status}`); _lastStatus.set(requestId, status); }
-
-      if (["completed", "succeeded", "success"].includes(status)) {
-        console.log(`[POLL DONE] ${requestId} outputs=${outputs.length}`);
-        await appendOutputsToSupabase(parentRowId, { outputUrls: outputs, requestId, failed: false });
-        return;
-      }
-      if (["failed", "error"].includes(status)) {
-        console.warn(`[POLL FAIL] ${requestId}`);
-        await appendOutputsToSupabase(parentRowId, { outputUrls: [], requestId, failed: true });
-        return;
-      }
-      await sleep(POLL_INTERVAL_MS);
-    } catch (err) {
-      console.warn(`[POLL ERROR] ${requestId}: ${err.message || err}`);
-      if (attempts < POLL_MAX_RETRIES) { await sleep(backoff(attempts++, POLL_BASE_DELAY_MS)); }
-      else { await appendOutputsToSupabase(parentRowId, { outputUrls: [], requestId, failed: true }); return; }
-    }
-  }
-  console.warn(`[POLL TIMEOUT] ${requestId}`);
-  await appendOutputsToSupabase(parentRowId, { outputUrls: [], requestId, failed: true });
-}
-
-/* ===================== Webhooks ===================== */
-// 1) Supabase Database Webhook → on INSERT into Generations
-app.post("/webhooks/supabase", async (req, res) => {
-  try {
-    // Supabase DB Webhooks send: { type, table, schema, record, old_record }
-    const { type, table, record } = req.body || {};
-    if (type === "INSERT" && (table?.name === "Generations" || table === "Generations")) {
-      const rowId = record.id;
-      // optional: only start if status is null/empty/queued
-      const status = record.status ? String(record.status).toLowerCase() : "";
-      if (!status || status === "queued" || status === "pending" || status === "null") {
-        const out = await startRunFromRow(rowId);
-        return res.json({ ok: true, started: out });
-      }
-    }
-    return res.status(202).json({ ok: false, reason: "Ignored event" });
-  } catch (e) {
-    console.error("[/webhooks/supabase ERROR]", e);
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-// 2) WaveSpeed webhook (optional fast-path; poller auch)
-app.post("/webhooks/wavespeed", async (req, res) => {
-  try {
-    const b = req.body || {};
-    const requestId = b.request_id || b.id || b.requestId || b.request || req.query.request_id;
-    const status = (b.status || b.state || "").toLowerCase();
-    const outputs = Array.isArray(b.output) ? b.output : Array.isArray(b.outputs) ? b.outputs : typeof b.output === "string" ? [b.output] : [];
-
-    const parentRowId = memoryRequestMap.get(requestId);
-    if (!requestId || !parentRowId) {
-      console.warn(`[WEBHOOK] Unknown parent for requestId=${requestId}. Returning 202.`);
-      return res.status(202).json({ ok: false, reason: "Unknown parent; poller will handle." });
-    }
-
-    if (["completed", "succeeded", "success"].includes(status)) {
-      await appendOutputsToSupabase(parentRowId, { outputUrls: outputs, requestId, failed: false });
-    } else if (["failed", "error"].includes(status)) {
-      await appendOutputsToSupabase(parentRowId, { outputUrls: [], requestId, failed: true });
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[/webhooks/wavespeed ERROR]", e);
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-/* ===================== Misc ===================== */
-app.get("/", (_, res) => res.send("WaveSpeed x Supabase is running. POST /webhooks/supabase on INSERT."));
-app.get("/debug/prediction/:id", async (req, res) => {
-  try {
-    const r = await fetch(`${WAVESPEED_BASE}${WAVESPEED_RESULT_PATH}/${encodeURIComponent(req.params.id)}/result`, { headers: { ...authHeader() } });
-    const text = await r.text();
-    res.status(r.status).type("application/json").send(text);
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  }
-});
-
-/* START */
-app.listen(PORT, () => {
-  console.log(`[BOOT] Server running on http://localhost:${PORT}`);
-  console.log(`[BOOT] Public base URL: ${PUBLIC_BASE_URL}`);
-  console.log(`[BOOT] Webhook (Supabase): ${PUBLIC_BASE_URL}/webhooks/supabase`);
-  console.log(`[BOOT] Webhook (WaveSpeed): ${PUBLIC_BASE_URL}/webhooks/wavespeed`);
-});
+async function pollUntil
