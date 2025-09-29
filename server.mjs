@@ -273,11 +273,14 @@ async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, fail
   const seen_ids = mergeIdString(row.seen_ids, requestId ? [requestId] : []);
   const failed_ids = failed ? mergeIdString(row.failed_ids, requestId ? [requestId] : []) : row.failed_ids;
 
-  await sbUpdateGenerationsRow(rowId, {
-    seen_ids,
-    failed_ids,
-    last_update: nowISO()
-  });
+await sbUpdateGenerationsRow(rowId, {
+  status: "processing",
+  request_ids: "",
+  seen_ids: "",
+  failed_ids: "",
+  last_update: nowISO(),
+  size: `${W}x${H}`
+});
 
   // Optional: weitere Output-Felder pflegen
   // await sbUpdateGenerationsRow(rowId, {
