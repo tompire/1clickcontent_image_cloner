@@ -171,11 +171,64 @@ function mergeIdString(s, add) {
   return [...set].join(", ");
 }
 
+const SOURCE_CONTENT_TABLE = "image_cloner_source_content";
+
+function extractSourceContentId(row = {}) {
+  if (!row || typeof row !== "object") return null;
+
+  const directId = row.image_cloner_source_content_id || row.source_content_id;
+  if (directId && typeof directId !== "object") return directId;
+
+  const nested = row.image_cloner_source_content || row.source_content;
+  if (nested && typeof nested === "object") {
+    if (nested.id) return nested.id;
+    if (nested.image_cloner_source_content_id) return nested.image_cloner_source_content_id;
+    if (nested.source_content_id) return nested.source_content_id;
+  }
+
+  if (row.metadata && typeof row.metadata === "object") {
+    const meta = row.metadata;
+    if (meta.source_content_id) return meta.source_content_id;
+    if (meta.image_cloner_source_content_id) return meta.image_cloner_source_content_id;
+  }
+  return null;
+}
+
+async function resolveOutputFolder(row) {
+  if (!row) return `runs/unknown`;
+  if (row.output_path_full_folder) return row.output_path_full_folder;
+
+  const sourceContentId = extractSourceContentId(row);
+  if (sourceContentId) {
+    try {
+      const { data, error } = await supabase
+        .from(SOURCE_CONTENT_TABLE)
+        .select("id,parent_awme_id")
+        .eq("id", sourceContentId)
+        .single();
+      if (error) throw error;
+      if (data?.parent_awme_id && data?.id) {
+        const folder = `${data.parent_awme_id}_${data.id}`;
+        await sbUpdateGenerationsRow(row.id, {
+          output_path_full_folder: folder,
+          last_update: nowISO()
+        });
+        row.output_path_full_folder = folder;
+        return folder;
+      }
+    } catch (err) {
+      console.warn(`[FOLDER WARN] Failed resolving folder for source content ${sourceContentId}: ${err.message || err}`);
+    }
+  }
+
+  return `runs/${row.id}`;
+}
+
 async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, failed = false }) {
   const row = await sbGetGenerationsRow(rowId);
 
   // Folder comes from row (e.g. "image_cloner_generations/3682...") :contentReference[oaicite:1]{index=1}
-  const folder = row.output_path_full_folder || `runs/${rowId}`;
+  const folder = await resolveOutputFolder(row);
   const savedPublicUrls = await storeOutputsToSupabaseFolder(folder, requestId, outputUrls);
 
   // Strings like in Airtable version, kept for parity
@@ -211,6 +264,7 @@ async function markCompletedIfReady(rowId) {
 /* ===================== Core Run ===================== */
 async function startRunFromRow(rowId, opts = {}) {
   const rec = await sbGetGenerationsRow(rowId);
+  await resolveOutputFolder(rec);
 
   // Fields from your Supabase row JSON (prompt, subject, reference, size, batch_count...) :contentReference[oaicite:2]{index=2}
   const prompt = String(rec.prompt || "");
