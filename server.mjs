@@ -71,6 +71,28 @@ async function fetchToBuffer(url) {
   return { buf: Buffer.from(await r.arrayBuffer()), ct: r.headers.get("content-type") || "image/png" };
 }
 
+// helper: strip bucket prefix from any provided folder path
+function stripBucketPrefix(folder, bucket = SUPABASE_BUCKET_GENERATIONS) {
+  if (!folder) return "";
+  return String(folder)
+    .replace(new RegExp(`^${bucket}/?`, "i"), "")
+    .replace(/^\/+/, "");
+}
+
+// ensure that a "folder" exists by uploading a tiny .keep file
+async function ensureFolderExists(folderPath) {
+  const folder = stripBucketPrefix(folderPath);
+  const key = `${folder.replace(/\/+$/, "")}/.keep`;
+  const { error } = await supabase
+    .storage
+    .from(SUPABASE_BUCKET_GENERATIONS)
+    .upload(key, new Blob([""]), { upsert: true, contentType: "text/plain" });
+  if (error && !/exists/i.test(error.message || "")) {
+    console.warn(`[FOLDER WARN] ensureFolderExists: ${error.message || error}`);
+  }
+  return folder;
+}
+
 /* ===================== Supabase Row ops ===================== */
 async function sbGetGenerationsRow(id) {
   const { data, error } = await supabase.from("Generations").select("*").eq("id", id).single();
@@ -143,16 +165,16 @@ async function getResult(requestId) {
 /* ===================== Upload outputs to Supabase Storage ===================== */
 async function storeOutputsToSupabaseFolder(folderPath, requestId, outputUrls = []) {
   const publicUrls = [];
+  const folder = stripBucketPrefix(folderPath); // normalize once
 
   for (let i = 0; i < outputUrls.length; i++) {
     const url = outputUrls[i];
     try {
       const { buf, ct } = await fetchToBuffer(url);
-      const key = `${folderPath}/output_${requestId}_${String(i + 1).padStart(2, "0")}.png`;
-      const { error } = await supabase.storage.from(SUPABASE_BUCKET_GENERATIONS).upload(key, buf, {
-        contentType: ct,
-        upsert: true
-      });
+      const key = `${folder}/output_${requestId}_${String(i + 1).padStart(2, "0")}.png`;
+      const { error } = await supabase.storage
+        .from(SUPABASE_BUCKET_GENERATIONS)
+        .upload(key, buf, { contentType: ct, upsert: true });
       if (error) throw error;
 
       const { data: pub } = supabase.storage.from(SUPABASE_BUCKET_GENERATIONS).getPublicUrl(key);
@@ -174,64 +196,73 @@ function mergeIdString(s, add) {
 const SOURCE_CONTENT_TABLE = "image_cloner_source_content";
 
 function extractSourceContentId(row = {}) {
-  if (!row || typeof row !== "object") return null;
-
-  const directId = row.image_cloner_source_content_id || row.source_content_id;
-  if (directId && typeof directId !== "object") return directId;
-
-  const nested = row.image_cloner_source_content || row.source_content;
-  if (nested && typeof nested === "object") {
-    if (nested.id) return nested.id;
-    if (nested.image_cloner_source_content_id) return nested.image_cloner_source_content_id;
-    if (nested.source_content_id) return nested.source_content_id;
-  }
-
-  if (row.metadata && typeof row.metadata === "object") {
-    const meta = row.metadata;
-    if (meta.source_content_id) return meta.source_content_id;
-    if (meta.image_cloner_source_content_id) return meta.image_cloner_source_content_id;
-  }
-  return null;
+  // direkte Felder, falls du die ID in Generations speicherst
+  return row?.image_cloner_source_content_id || row?.source_content_id || null;
 }
 
 async function resolveOutputFolder(row) {
-  if (!row) return `runs/unknown`;
-  if (row.output_path_full_folder) return row.output_path_full_folder;
+  if (!row) return await ensureFolderExists(`runs/unknown`);
 
-  const sourceContentId = extractSourceContentId(row);
-  if (sourceContentId) {
+  // 1) bereits vorgegeben?
+  if (row.output_path_full_folder) {
+    const normalized = stripBucketPrefix(row.output_path_full_folder);
+    await ensureFolderExists(normalized);
+    return normalized;
+  }
+
+  // 2) wir haben die ID des image_cloner_source_content?
+  const scId = extractSourceContentId(row);
+  if (scId) {
     try {
       const { data, error } = await supabase
         .from(SOURCE_CONTENT_TABLE)
         .select("id,parent_awme_id")
-        .eq("id", sourceContentId)
+        .eq("id", scId)
         .single();
       if (error) throw error;
       if (data?.parent_awme_id && data?.id) {
-        const folder = `${data.parent_awme_id}_${data.id}`;
+        const folder = `${data.parent_awme_id}/${data.id}`;
+        await ensureFolderExists(folder);
         await sbUpdateGenerationsRow(row.id, {
           output_path_full_folder: folder,
           last_update: nowISO()
         });
-        row.output_path_full_folder = folder;
         return folder;
       }
     } catch (err) {
-      console.warn(`[FOLDER WARN] Failed resolving folder for source content ${sourceContentId}: ${err.message || err}`);
+      console.warn(`[FOLDER WARN] lookup by source_content_id=${scId}: ${err.message || err}`);
     }
   }
 
-  return `runs/${row.id}`;
+  // 3) Fallback: nur parent_awme_id in der Generations-Row vorhanden
+  if (row.source_content_awme_id) {
+    const folder = `${row.source_content_awme_id}/${row.id}`;
+    await ensureFolderExists(folder);
+    await sbUpdateGenerationsRow(row.id, {
+      output_path_full_folder: folder,
+      last_update: nowISO()
+    });
+    return folder;
+  }
+
+  // 4) letzter Fallback
+  const folder = `runs/${row.id}`;
+  await ensureFolderExists(folder);
+  await sbUpdateGenerationsRow(row.id, {
+    output_path_full_folder: folder,
+    last_update: nowISO()
+  });
+  return folder;
 }
 
 async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, failed = false }) {
   const row = await sbGetGenerationsRow(rowId);
 
-  // Folder comes from row (e.g. "image_cloner_generations/3682...") :contentReference[oaicite:1]{index=1}
+  // Ordner sicherstellen (inkl. .keep)
   const folder = await resolveOutputFolder(row);
   const savedPublicUrls = await storeOutputsToSupabaseFolder(folder, requestId, outputUrls);
 
-  // Strings like in Airtable version, kept for parity
+  // Strings wie im Airtable-Flow
   const seen_ids = mergeIdString(row.seen_ids, requestId ? [requestId] : []);
   const failed_ids = failed ? mergeIdString(row.failed_ids, requestId ? [requestId] : []) : row.failed_ids;
 
@@ -241,11 +272,11 @@ async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, fail
     last_update: nowISO()
   });
 
-  // Optional: if your table has these columns, uncomment and keep.
+  // Optional: weitere Output-Felder pflegen
   // await sbUpdateGenerationsRow(rowId, {
   //   output_first_url: savedPublicUrls[0] || null,
   //   output_count: (row.output_count || 0) + savedPublicUrls.length,
-  //   output_urls: savedPublicUrls  // if text[] or jsonb column exists
+  //   output_urls: savedPublicUrls
   // });
 
   await markCompletedIfReady(rowId);
@@ -264,9 +295,8 @@ async function markCompletedIfReady(rowId) {
 /* ===================== Core Run ===================== */
 async function startRunFromRow(rowId, opts = {}) {
   const rec = await sbGetGenerationsRow(rowId);
-  await resolveOutputFolder(rec);
+  await resolveOutputFolder(rec); // proaktiv Ordner anlegen
 
-  // Fields from your Supabase row JSON (prompt, subject, reference, size, batch_count...) :contentReference[oaicite:2]{index=2}
   const prompt = String(rec.prompt || "");
   const subject_url = rec.subject || "";
   const reference_urls = rec.reference ? [rec.reference] : [];
@@ -295,7 +325,7 @@ async function startRunFromRow(rowId, opts = {}) {
     size: `${W}x${H}`
   });
 
-  // Batch count (cap 8 as before)
+  // Batch count (cap 8)
   const N = Math.max(1, Math.min(8, Number(rec.batch_count || opts.batch || 4)));
 
   const requestIds = [];
@@ -379,7 +409,7 @@ app.post("/webhooks/supabase", async (req, res) => {
   }
 });
 
-// 2) WaveSpeed webhook (optional fast-path; poller also handles)
+// 2) WaveSpeed webhook (optional fast-path; poller auch)
 app.post("/webhooks/wavespeed", async (req, res) => {
   try {
     const b = req.body || {};
