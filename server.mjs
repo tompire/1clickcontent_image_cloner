@@ -73,7 +73,34 @@ async function urlToDataURL(imageUrl) {
 async function fetchToBuffer(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Fetch failed ${r.status} ${r.statusText}`);
-  return { buf: Buffer.from(await r.arrayBuffer()), ct: r.headers.get("content-type") || "image/png" };
+  const buf = Buffer.from(await r.arrayBuffer());
+
+  // try header first
+  let ct = (r.headers.get("content-type") || "").toLowerCase();
+
+  // sniff magic bytes (PNG/JPEG/WEBP/GIF)
+  const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+  const head4 = `${b0.toString(16)}${b1.toString(16)}${b2.toString(16)}${b3.toString(16)}`;
+
+  let ext = "png";
+  if (buf.length > 3 && b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) { // PNG
+    ext = "png"; if (!ct) ct = "image/png";
+  } else if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) { // JPEG
+    ext = "jpg"; if (!ct) ct = "image/jpeg";
+  } else if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) { // GIF
+    ext = "gif"; if (!ct) ct = "image/gif";
+  } else if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46 && buf.slice(8,12).toString() === "WEBP") { // WEBP
+    ext = "webp"; if (!ct) ct = "image/webp";
+  } else {
+    // fallback auf Header oder PNG
+    if (!ct || ct === "application/octet-stream") ct = "image/png";
+    if (ct.includes("jpeg")) ext = "jpg";
+    else if (ct.includes("webp")) ext = "webp";
+    else if (ct.includes("gif")) ext = "gif";
+    else ext = "png";
+  }
+
+  return { buf, ct, ext, head4 };
 }
 
 function stripBucketPrefix(folder, bucket = SUPABASE_BUCKET_GENERATIONS) {
@@ -185,11 +212,17 @@ async function storeOutputsToSupabaseFolder(folderPath, requestId, outputUrls = 
   for (let i = 0; i < outputUrls.length; i++) {
     const url = outputUrls[i];
     try {
-      const { buf, ct } = await fetchToBuffer(url);
-      const key = `${folder}/output_${requestId}_${String(i + 1).padStart(2, "0")}.png`;
-      const { error } = await supabase.storage.from(SUPABASE_BUCKET_GENERATIONS)
-        .upload(key, buf, { contentType: ct, upsert: true });
+      const { buf, ct, ext } = await fetchToBuffer(url);
+      const key = `${folder}/output_${requestId}_${String(i + 1).padStart(2, "0")}.${ext}`;
+      const { error } = await supabase.storage
+        .from(SUPABASE_BUCKET_GENERATIONS)
+        .upload(key, buf, {
+          contentType: ct,
+          upsert: true,            // ok: wir überschreiben gleiche keys
+          cacheControl: "31536000" // optional
+        });
       if (error) throw error;
+
       const { data: pub } = supabase.storage.from(SUPABASE_BUCKET_GENERATIONS).getPublicUrl(key);
       publicUrls.push(pub.publicUrl);
     } catch (e) {
