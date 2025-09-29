@@ -29,14 +29,11 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: "10mb" }));
 
-// ---- Global request logger (zeigt, ob überhaupt etwas reinkommt)
-app.use((req, _res, next) => {
-  console.log("[REQ]", req.method, req.url);
-  next();
-});
+// global request logger
+app.use((req, _res, next) => { console.log("[REQ]", req.method, req.url); next(); });
 
-const MODEL_NAME = "Seedream v4 (edit-sequential)";
-const GENERATIONS_TABLE = "image_cloner_generations"; // <— einheitlich!
+const GENERATIONS_TABLE = "image_cloner_generations";
+const SOURCE_CONTENT_TABLE = "image_cloner_source_content";
 
 const SUBMIT_MAX_RETRIES = 3;
 const SUBMIT_BASE_DELAY_MS = 500;
@@ -47,7 +44,8 @@ const POLL_TIMEOUT_MS = 20 * 60 * 1000;
 const POLL_MAX_RETRIES = 3;
 const POLL_BASE_DELAY_MS = 800;
 
-const MIN_PIXELS = 921600; // 960x960 Minimum
+const MIN_PIXELS = 921600; // 960x960
+
 const ensureMinPixels = (w, h, min = MIN_PIXELS) => {
   if (w * h >= min) return { w, h };
   const s = Math.sqrt(min / (w * h));
@@ -78,36 +76,51 @@ async function fetchToBuffer(url) {
   return { buf: Buffer.from(await r.arrayBuffer()), ct: r.headers.get("content-type") || "image/png" };
 }
 
-// helper: strip bucket prefix from any provided folder path
 function stripBucketPrefix(folder, bucket = SUPABASE_BUCKET_GENERATIONS) {
   if (!folder) return "";
-  return String(folder)
-    .replace(new RegExp(`^${bucket}/?`, "i"), "")
-    .replace(/^\/+/, "");
+  return String(folder).replace(new RegExp(`^${bucket}/?`, "i"), "").replace(/^\/+/, "");
 }
-
-// ensure that a "folder" exists by uploading a tiny .keep file
 async function ensureFolderExists(folderPath) {
   const folder = stripBucketPrefix(folderPath);
   const key = `${folder.replace(/\/+$/, "")}/.keep`;
-  const { error } = await supabase
-    .storage
-    .from(SUPABASE_BUCKET_GENERATIONS)
-    .upload(key, new Blob([""]), { upsert: true, contentType: "text/plain" });
-  if (error && !/exists/i.test(error.message || "")) {
-    console.warn(`[FOLDER WARN] ensureFolderExists: ${error.message || error}`);
-  }
+  const { error } = await supabase.storage.from(SUPABASE_BUCKET_GENERATIONS)
+    .upload(key, Buffer.from(""), { upsert: true, contentType: "text/plain" });
+  if (error && !/exists/i.test(error.message || "")) console.warn(`[FOLDER WARN] ensureFolderExists: ${error.message || error}`);
   return folder;
 }
 
 /* ===================== Supabase Row ops ===================== */
+// whitelist to avoid schema errors
+const GEN_ALLOWED_FIELDS = new Set([
+  "prompt",
+  "subject",
+  "reference",
+  "size",
+  "batch_count",
+  "request_ids",
+  "seen_ids",
+  "failed_ids",
+  "status",
+  "run_id",
+  "last_update",
+  "completed_at",
+  "output_path_full_folder",
+  "source_content_folder_path",
+  "source_content_reference_path",
+  "source_content_awme_id"
+]);
+
 async function sbGetGenerationsRow(id) {
   const { data, error } = await supabase.from(GENERATIONS_TABLE).select("*").eq("id", id).single();
   if (error) throw error;
   return data;
 }
 async function sbUpdateGenerationsRow(id, fields) {
-  const { error } = await supabase.from(GENERATIONS_TABLE).update(fields).eq("id", id);
+  const safe = Object.fromEntries(
+    Object.entries(fields || {}).filter(([k, v]) => GEN_ALLOWED_FIELDS.has(k) && v !== undefined)
+  );
+  if (Object.keys(safe).length === 0) { console.warn("[SAFE UPDATE] nothing to update for row", id); return; }
+  const { error } = await supabase.from(GENERATIONS_TABLE).update(safe).eq("id", id);
   if (error) throw error;
 }
 
@@ -117,13 +130,10 @@ const authHeader = () =>
     ? { Authorization: `Bearer ${WAVESPEED_API_KEY}` }
     : { [WAVESPEED_AUTH_HEADER]: WAVESPEED_API_KEY };
 
-// requestId -> parentRowId
-const memoryRequestMap = new Map();
+const memoryRequestMap = new Map(); // requestId -> parentRowId
 
 async function submitGeneration({ prompt, subjectDataUrl, refDataUrls, width, height }, parentRowId) {
-  // IMPORTANT for edit-sequential: REFs first, SUBJECT last
   const images = [...(refDataUrls || []), subjectDataUrl].filter(Boolean);
-
   const payload = {
     size: `${width}*${height}`,
     max_images: 1,
@@ -142,13 +152,11 @@ async function submitGeneration({ prompt, subjectDataUrl, refDataUrls, width, he
     headers: { "Content-Type": "application/json", ...authHeader() },
     body: JSON.stringify(payload)
   });
-
   if (!res.ok) throw new Error(`WaveSpeed submit failed: ${res.status} ${await res.text()}`);
   const json = await res.json();
 
   const requestId = json?.data?.id || json?.requestId || json?.id || json?.request_id;
   if (!requestId) throw new Error(`Missing requestId in response: ${JSON.stringify(json)}`);
-
   if (parentRowId) memoryRequestMap.set(requestId, parentRowId);
   return requestId;
 }
@@ -169,21 +177,19 @@ async function getResult(requestId) {
   return { status, outputs: (outs || []).map(String).filter(Boolean), raw: json };
 }
 
-/* ===================== Upload outputs to Supabase Storage ===================== */
+/* ===================== Storage ===================== */
 async function storeOutputsToSupabaseFolder(folderPath, requestId, outputUrls = []) {
   const publicUrls = [];
-  const folder = stripBucketPrefix(folderPath); // normalize once
+  const folder = stripBucketPrefix(folderPath);
 
   for (let i = 0; i < outputUrls.length; i++) {
     const url = outputUrls[i];
     try {
       const { buf, ct } = await fetchToBuffer(url);
       const key = `${folder}/output_${requestId}_${String(i + 1).padStart(2, "0")}.png`;
-      const { error } = await supabase.storage
-        .from(SUPABASE_BUCKET_GENERATIONS)
+      const { error } = await supabase.storage.from(SUPABASE_BUCKET_GENERATIONS)
         .upload(key, buf, { contentType: ct, upsert: true });
       if (error) throw error;
-
       const { data: pub } = supabase.storage.from(SUPABASE_BUCKET_GENERATIONS).getPublicUrl(key);
       publicUrls.push(pub.publicUrl);
     } catch (e) {
@@ -200,40 +206,29 @@ function mergeIdString(s, add) {
   return [...set].join(", ");
 }
 
-const SOURCE_CONTENT_TABLE = "image_cloner_source_content";
-
 function extractSourceContentId(row = {}) {
-  // direkte Felder, falls du die ID in Generations speicherst
   return row?.image_cloner_source_content_id || row?.source_content_id || null;
 }
 
 async function resolveOutputFolder(row) {
   if (!row) return await ensureFolderExists(`runs/unknown`);
 
-  // 1) bereits vorgegeben?
   if (row.output_path_full_folder) {
     const normalized = stripBucketPrefix(row.output_path_full_folder);
     await ensureFolderExists(normalized);
     return normalized;
   }
 
-  // 2) wir haben die ID des image_cloner_source_content?
   const scId = extractSourceContentId(row);
   if (scId) {
     try {
-      const { data, error } = await supabase
-        .from(SOURCE_CONTENT_TABLE)
-        .select("id,parent_awme_id")
-        .eq("id", scId)
-        .single();
+      const { data, error } = await supabase.from(SOURCE_CONTENT_TABLE)
+        .select("id,parent_awme_id").eq("id", scId).single();
       if (error) throw error;
       if (data?.parent_awme_id && data?.id) {
         const folder = `${data.parent_awme_id}/${data.id}`;
         await ensureFolderExists(folder);
-        await sbUpdateGenerationsRow(row.id, {
-          output_path_full_folder: folder,
-          last_update: nowISO()
-        });
+        await sbUpdateGenerationsRow(row.id, { output_path_full_folder: folder, last_update: nowISO() });
         return folder;
       }
     } catch (err) {
@@ -241,53 +236,33 @@ async function resolveOutputFolder(row) {
     }
   }
 
-  // 3) Fallback: nur parent_awme_id in der Generations-Row vorhanden
   if (row.source_content_awme_id) {
     const folder = `${row.source_content_awme_id}/${row.id}`;
     await ensureFolderExists(folder);
-    await sbUpdateGenerationsRow(row.id, {
-      output_path_full_folder: folder,
-      last_update: nowISO()
-    });
+    await sbUpdateGenerationsRow(row.id, { output_path_full_folder: folder, last_update: nowISO() });
     return folder;
   }
 
-  // 4) letzter Fallback
   const folder = `runs/${row.id}`;
   await ensureFolderExists(folder);
-  await sbUpdateGenerationsRow(row.id, {
-    output_path_full_folder: folder,
-    last_update: nowISO()
-  });
+  await sbUpdateGenerationsRow(row.id, { output_path_full_folder: folder, last_update: nowISO() });
   return folder;
 }
 
 async function appendOutputsToSupabase(rowId, { outputUrls = [], requestId, failed = false }) {
   const row = await sbGetGenerationsRow(rowId);
 
-  // Ordner sicherstellen (inkl. .keep)
   const folder = await resolveOutputFolder(row);
-  const savedPublicUrls = await storeOutputsToSupabaseFolder(folder, requestId, outputUrls);
+  await storeOutputsToSupabaseFolder(folder, requestId, outputUrls);
 
-  // Strings wie im Airtable-Flow
   const seen_ids = mergeIdString(row.seen_ids, requestId ? [requestId] : []);
   const failed_ids = failed ? mergeIdString(row.failed_ids, requestId ? [requestId] : []) : row.failed_ids;
 
-await sbUpdateGenerationsRow(rowId, {
-  status: "processing",
-  request_ids: "",
-  seen_ids: "",
-  failed_ids: "",
-  last_update: nowISO(),
-  size: `${W}x${H}`
-});
-
-  // Optional: weitere Output-Felder pflegen
-  // await sbUpdateGenerationsRow(rowId, {
-  //   output_first_url: savedPublicUrls[0] || null,
-  //   output_count: (row.output_count || 0) + savedPublicUrls.length,
-  //   output_urls: savedPublicUrls
-  // });
+  await sbUpdateGenerationsRow(rowId, {
+    seen_ids,
+    failed_ids,
+    last_update: nowISO()
+  });
 
   await markCompletedIfReady(rowId);
 }
@@ -297,15 +272,13 @@ async function markCompletedIfReady(rowId) {
   const req = new Set(String(row.request_ids || "").split(",").map(s => s.trim()).filter(Boolean));
   const seen = new Set(String(row.seen_ids || "").split(",").map(s => s.trim()).filter(Boolean));
   const done = req.size > 0 && [...req].every(x => seen.has(x));
-  if (done) {
-    await sbUpdateGenerationsRow(rowId, { status: "completed", completed_at: nowISO(), last_update: nowISO() });
-  }
+  if (done) await sbUpdateGenerationsRow(rowId, { status: "completed", completed_at: nowISO(), last_update: nowISO() });
 }
 
 /* ===================== Core Run ===================== */
 async function startRunFromRow(rowId, opts = {}) {
   const rec = await sbGetGenerationsRow(rowId);
-  await resolveOutputFolder(rec); // proaktiv Ordner anlegen
+  await resolveOutputFolder(rec);
 
   const prompt = String(rec.prompt || "");
   const subject_url = rec.subject || "";
@@ -319,26 +292,23 @@ async function startRunFromRow(rowId, opts = {}) {
   }
   ({ w: W, h: H } = ensureMinPixels(W, H));
 
-  // Convert inputs to data URLs
   const subjectDataUrl = await urlToDataURL(subject_url);
   const refDataUrls = [];
   for (const r of reference_urls) { try { refDataUrls.push(await urlToDataURL(r)); } catch (e) { console.warn("[REF WARN]", r, e.message); } }
 
-  // Reset status
+  // Reset status (only existing columns)
   await sbUpdateGenerationsRow(rowId, {
     status: "processing",
     request_ids: "",
     seen_ids: "",
     failed_ids: "",
     last_update: nowISO(),
-    model: MODEL_NAME,
     size: `${W}x${H}`
   });
 
-  // Batch count (cap 8)
   const N = Math.max(1, Math.min(8, Number(rec.batch_count || opts.batch || 4)));
-
   const requestIds = [];
+
   for (let i = 0; i < N; i++) {
     let rid = null, lastErr = null;
     for (let a = 0; a < SUBMIT_MAX_RETRIES && !rid; a++) {
@@ -355,7 +325,6 @@ async function startRunFromRow(rowId, opts = {}) {
 
   await sbUpdateGenerationsRow(rowId, { request_ids: requestIds.join(", "), last_update: nowISO() });
 
-  // Poll all
   requestIds.forEach(rid => pollUntilDone(rid, rowId).catch(e => console.error("[POLL ERROR]", rid, e.message)));
 
   return { rowId, submitted: requestIds.length, request_ids: requestIds };
@@ -389,7 +358,7 @@ async function pollUntilDone(requestId, parentRowId) {
       await sleep(POLL_INTERVAL_MS);
     } catch (err) {
       console.warn(`[POLL ERROR] ${requestId}: ${err.message || err}`);
-      if (attempts < POLL_MAX_RETRIES) { await sleep(backoff(attempts++, POLL_BASE_DELAY_MS)); }
+      if (attempts < POLL_MAX_RETRIES) await sleep(backoff(attempts++, POLL_BASE_DELAY_MS));
       else { await appendOutputsToSupabase(parentRowId, { outputUrls: [], requestId, failed: true }); return; }
     }
   }
@@ -402,7 +371,6 @@ app.post("/debug/echo", (req, res) => {
   console.log("[DEBUG ECHO] body=", JSON.stringify(req.body));
   res.json({ ok: true, received: req.body });
 });
-
 app.post("/debug/start/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -415,12 +383,9 @@ app.post("/debug/start/:id", async (req, res) => {
 });
 
 /* ===================== Webhooks ===================== */
-// 1) Supabase Database Webhook → on INSERT into image_cloner_generations
 app.post("/webhooks/supabase", async (req, res) => {
-  // umfassendes Logging, damit wir es in Render-Logs sehen
   console.log("[WH DEBUG] /webhooks/supabase payload=", JSON.stringify(req.body));
   try {
-    // Supabase DB Webhooks send: { type, table, schema, record, old_record }
     const { type, table, record } = req.body || {};
     const tableName =
       (table && typeof table === "object" && (table.name || table.table || table.relation)) ||
@@ -428,14 +393,9 @@ app.post("/webhooks/supabase", async (req, res) => {
 
     console.log("[WH DEBUG] type=", type, "resolvedTableName=", tableName);
 
-    if (
-      String(type).toUpperCase() === "INSERT" &&
-      String(tableName).toLowerCase() === GENERATIONS_TABLE
-    ) {
+    if (String(type).toUpperCase() === "INSERT" && String(tableName).toLowerCase() === GENERATIONS_TABLE) {
       const rowId = record?.id;
       if (!rowId) return res.status(400).json({ error: "Missing record.id" });
-
-      // optional: only start if status is null/empty/queued
       const status = record.status ? String(record.status).toLowerCase() : "";
       if (!status || status === "queued" || status === "pending" || status === "null") {
         const out = await startRunFromRow(rowId);
@@ -453,7 +413,6 @@ app.post("/webhooks/supabase", async (req, res) => {
   }
 });
 
-// 2) WaveSpeed webhook (optional fast-path; poller auch)
 app.post("/webhooks/wavespeed", async (req, res) => {
   try {
     const b = req.body || {};
@@ -480,9 +439,7 @@ app.post("/webhooks/wavespeed", async (req, res) => {
 });
 
 /* ===================== Misc ===================== */
-app.get("/", (_req, res) =>
-  res.send("WaveSpeed x Supabase is running. POST /webhooks/supabase on INSERT.")
-);
+app.get("/", (_req, res) => res.send("WaveSpeed x Supabase is running. POST /webhooks/supabase on INSERT."));
 app.get("/debug/prediction/:id", async (req, res) => {
   try {
     const r = await fetch(`${WAVESPEED_BASE}${WAVESPEED_RESULT_PATH}/${encodeURIComponent(req.params.id)}/result`, { headers: { ...authHeader() } });
