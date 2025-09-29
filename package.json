@@ -1,0 +1,14 @@
+{
+  "name": "wavespeed-seedream-supabase",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
