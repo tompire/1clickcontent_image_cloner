@@ -16,7 +16,7 @@ const {
 
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
-  SUPABASE_BUCKET_GENERATIONS = "ic_generations",
+  SUPABASE_BUCKET_GENERATIONS = "image_cloner_generations",
 } = process.env;
 
 if (!PUBLIC_BASE_URL || !WAVESPEED_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
