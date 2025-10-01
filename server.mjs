@@ -16,7 +16,7 @@ const {
 
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
-  SUPABASE_BUCKET_GENERATIONS = "image_cloner_generations",
+  SUPABASE_BUCKET_GENERATIONS = "ic_generations",
 } = process.env;
 
 if (!PUBLIC_BASE_URL || !WAVESPEED_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -32,8 +32,8 @@ app.use(express.json({ limit: "10mb" }));
 // global request logger
 app.use((req, _res, next) => { console.log("[REQ]", req.method, req.url); next(); });
 
-const GENERATIONS_TABLE = "image_cloner_generations";
-const SOURCE_CONTENT_TABLE = "image_cloner_source_content";
+const GENERATIONS_TABLE = "ic_generations";
+const SOURCE_CONTENT_TABLE = "ic_source_media_items";
 
 const SUBMIT_MAX_RETRIES = 3;
 const SUBMIT_BASE_DELAY_MS = 500;
@@ -240,7 +240,7 @@ function mergeIdString(s, add) {
 }
 
 function extractSourceContentId(row = {}) {
-  return row?.image_cloner_source_content_id || row?.source_content_id || null;
+  return row?.ic_source_media_items_id || row?.source_content_id || null;
 }
 
 async function resolveOutputFolder(row) {
